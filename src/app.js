@@ -29,13 +29,18 @@ class AuraGitHubApp {
     });
 
     this.auraClient = new AuraOneClient({
-      apiKey: options.auraApiKey || process.env.AURA_API_KEY,
+      apiKey:
+        options.auraApiKey ||
+        process.env.AURAONE_API_KEY ||
+        process.env.AURA_API_KEY,
       baseUrl:
         options.auraBaseUrl ||
+        process.env.AURAONE_BASE_URL ||
         process.env.AURA_BASE_URL ||
         "https://api.auraone.ai",
     });
-    this.orgId = options.orgId || process.env.AURA_ORG_ID;
+    this.orgId =
+      options.orgId || process.env.AURAONE_ORG_ID || process.env.AURA_ORG_ID;
 
     this.setupWebhooks();
   }
@@ -172,7 +177,7 @@ class AuraGitHubApp {
   }
 
   async handleMainPush(context) {
-    const { repository, commits } = context.payload;
+    const { repository } = context.payload;
 
     try {
       const octokit = await this.githubApp.getInstallationOctokit(
@@ -223,7 +228,7 @@ class AuraGitHubApp {
         const content = Buffer.from(data.content, "base64").toString();
         return require("js-yaml").load(content);
       }
-    } catch (error) {
+    } catch {
       // Try .auraone.yaml as fallback
       try {
         const { data } = await octokit.rest.repos.getContent({
@@ -237,7 +242,7 @@ class AuraGitHubApp {
           const content = Buffer.from(data.content, "base64").toString();
           return require("js-yaml").load(content);
         }
-      } catch (error2) {
+      } catch {
         logger.info("No AuraOne config found");
       }
     }

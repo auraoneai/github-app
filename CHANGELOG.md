@@ -2,6 +2,14 @@
 
 All notable changes to `@auraone/github-app` are documented here.
 
+## [0.1.1] - 2026-07-07
+
+### Changed
+
+- Reworked README, npm metadata, and package contents for the public npm package.
+- Documented install-first setup, GitHub App webhook usage, repository config, and package limitations.
+- Added support for `AURAONE_API_KEY`, `AURAONE_BASE_URL`, and `AURAONE_ORG_ID` environment variable names while preserving existing `AURA_*` aliases.
+
 ## [0.1.0] - 2026-05-11
 
 Initial public release.
