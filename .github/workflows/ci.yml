@@ -6,18 +6,36 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
+  workflow-lint:
+    name: release workflow contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/*.yml
+
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "20.x"
-      - name: Install (skip @auraone/sdk linking issues for now)
-        run: npm install --no-package-lock || true
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
       - name: Lint
         run: npm run lint
       - name: Test
-        run: npm test
+        run: npm test -- --runInBand

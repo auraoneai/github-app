@@ -2,6 +2,40 @@
 
 All notable changes to `@auraone/github-app` are documented here.
 
+## [Unreleased]
+
+No changes yet.
+
+## [0.2.0] - 2026-07-13
+
+This release is prepared in source. Publication is recorded separately and is
+not implied by this changelog entry.
+
+### Added
+
+- Added lifecycle Check Runs with queued, in-progress, passed, failed, skipped,
+  action-required, and error presentation.
+- Added a **Run again** Check Run action that reevaluates the associated pull
+  request without requiring a new commit.
+- Added deterministic npm release automation using a lockfile, trusted
+  publishing, release-tag validation, package inspection, and provenance.
+
+### Changed
+
+- Reworked the README and npm metadata around repository-owner discovery,
+  source-first self-hosting, exact permissions and webhooks, runtime/data
+  boundaries, evidence/remediation output, deployment proof, release proof,
+  limitations, and a concrete first workflow.
+- Raised the declared Node.js runtime floor from 16 to 18 to match the current
+  Octokit dependency requirements.
+- Replaced legacy commit statuses with `AuraOne evaluation` Check Runs that
+  include the decision, score, threshold, commit, configuration path,
+  template-level evidence, exact details URL, and remediation guidance.
+- Changed pull request reporting to update one app-owned summary comment in
+  place; repositories can disable the comment with `pr_comment: false`.
+- Escaped configuration and API-derived Markdown content before publishing it
+  to GitHub.
+
 ## [0.1.1] - 2026-07-07
 
 ### Changed
@@ -24,4 +58,4 @@ Initial public release.
 
 ### Notes
 
-- Distributed as source for self-hosting. A hosted version is available via the AuraOne dashboard.
+- Distributed as source for self-hosting.

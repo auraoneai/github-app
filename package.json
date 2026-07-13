@@ -1,7 +1,7 @@
 {
   "name": "@auraone/github-app",
-  "version": "0.1.1",
-  "description": "Self-hosted Node.js GitHub App for running AuraOne AI agent evaluations on pull requests and posting checks.",
+  "version": "0.2.0",
+  "description": "Self-hosted GitHub App that reports AuraOne PR evaluations in one lifecycle-aware Check Run and one idempotent bot-owned PR summary.",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
@@ -11,17 +11,24 @@
     "lint:fix": "eslint src --ext .js --fix"
   },
   "keywords": [
+    "ai-evaluation",
+    "ai-evals",
+    "agent-evaluation",
+    "auraone",
+    "branch-protection",
+    "check-run",
+    "code-review",
+    "developer-tools",
+    "github",
     "github-app",
     "github-checks",
-    "pull-request",
-    "webhook",
-    "ci-cd",
-    "merge-gate",
-    "auraone",
-    "ai-evaluation",
-    "agent-evaluation",
     "llm-evaluation",
-    "nodejs"
+    "merge-gate",
+    "pull-request",
+    "pull-request-checks",
+    "quality-gate",
+    "self-hosted",
+    "webhook"
   ],
   "author": "AuraOne",
   "license": "MIT",
@@ -37,7 +44,7 @@
     "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "repository": {
     "type": "git",
@@ -47,6 +54,10 @@
     "url": "https://github.com/auraoneai/github-app/issues"
   },
   "homepage": "https://github.com/auraoneai/github-app#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "files": [
     "src",
     "README.md",

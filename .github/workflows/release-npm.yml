@@ -1,0 +1,342 @@
+name: release npm
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing immutable release tag, for example v0.2.0"
+        required: true
+        type: string
+      publish:
+        description: "Publish the verified tarball to npm and attach it to GitHub Releases"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-npm-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: test + pack + verify
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.release.outputs.artifact_name }}
+      npm_tag: ${{ steps.release.outputs.npm_tag }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14.0"
+          cache: npm
+      - name: Use an npm version that supports trusted publishing
+        run: npm install --global npm@11.18.0
+      - name: Resolve and validate immutable release tag
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_RELEASE_TAG"
+          else
+            tag="$REF_NAME"
+          fi
+          if [[ ! "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be an exact v-prefixed semantic version: $tag" >&2
+            exit 1
+          fi
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          curl -fsS https://updates.auraone.ai/keys/auraone-open.gpg |
+            gpg --batch --import
+          fingerprints="$(
+            gpg --batch --with-colons --fingerprint |
+              awk -F: '/^fpr:/ { print $10 }'
+          )"
+          test "$fingerprints" = "F909806D13D9CD4CF403FA3C8C61E177EB6329E7"
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git cat-file -t "refs/tags/$tag")" = "tag"
+          verify_output="$(git verify-tag --raw "$tag" 2>&1)"
+          printf '%s\n' "$verify_output"
+          tag_signer="$(
+            printf '%s\n' "$verify_output" |
+              awk '/\[GNUPG:\] VALIDSIG / { print $3; exit }'
+          )"
+          test "$tag_signer" = "F909806D13D9CD4CF403FA3C8C61E177EB6329E7"
+          tag_commit="$(git rev-parse "$tag^{}")"
+          test "$(git rev-parse HEAD)" = "$tag_commit"
+          version="$(node -p "require('./package.json').version")"
+          test "$tag" = "v$version"
+          version_without_build="${version%%+*}"
+          if [[ "$version_without_build" == *-* ]]; then
+            prerelease="${version_without_build#*-}"
+            npm_tag="${prerelease%%.*}"
+            case "$npm_tag" in
+              alpha|beta|rc|next|canary) ;;
+              *)
+                echo "Unsupported npm prerelease identifier: $npm_tag" >&2
+                exit 1
+                ;;
+            esac
+          else
+            npm_tag="latest"
+          fi
+          {
+            echo "artifact_name=github-app-npm-$version"
+            echo "npm_tag=$npm_tag"
+            echo "source_commit=$tag_commit"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install dependencies
+        run: npm ci
+      - name: Run release preflight
+        run: node scripts/release-preflight.mjs "${{ steps.release.outputs.tag }}"
+      - name: Build exact release tarball, checksum, and SBOM
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          npm pack --json --ignore-scripts --pack-destination release > release/pack.json
+          tarball="$(node -e "const fs=require('fs'); const [pack]=JSON.parse(fs.readFileSync('release/pack.json')); process.stdout.write(pack.filename)")"
+          (
+            cd release
+            sha256sum "$tarball" > "$tarball.sha256"
+          )
+          npm sbom --sbom-format cyclonedx > "release/$tarball.cdx.json"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+      - name: Verify packed package consumption
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp_project="$(mktemp -d)"
+          npm --prefix "$temp_project" init --yes
+          npm install \
+            --prefix "$temp_project" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "$GITHUB_WORKSPACE/release/${{ steps.pack.outputs.tarball }}"
+          node -e "const GitHubApp = require('$temp_project/node_modules/@auraone/github-app'); if (typeof GitHubApp !== 'function') process.exit(1)"
+      - name: Upload immutable release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.release.outputs.artifact_name }}
+          path: |
+            release/${{ steps.pack.outputs.tarball }}
+            release/${{ steps.pack.outputs.tarball }}.sha256
+            release/${{ steps.pack.outputs.tarball }}.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: publish with npm trusted publishing
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@auraone/github-app/v/${{ needs.build.outputs.version }}
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14.0"
+          registry-url: "https://registry.npmjs.org"
+      - name: Use an npm version that supports trusted publishing
+        run: npm install --global npm@11.18.0
+      - uses: actions/checkout@v4
+        with:
+          repository: auraoneai/open
+          ref: ${{ vars.OSS_PUBLICATION_AUTHORIZATION_TAG }}
+          path: .publication-authorization
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify signed coordinated publication authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          authorization_tag="${{ vars.OSS_PUBLICATION_AUTHORIZATION_TAG }}"
+          if [[ -z "$authorization_tag" ]]; then
+            echo "OSS_PUBLICATION_AUTHORIZATION_TAG must name a signed annotated tag" >&2
+            exit 1
+          fi
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          trap 'rm -rf "$GNUPGHOME"' EXIT
+          curl -fsS https://updates.auraone.ai/keys/auraone-open.gpg |
+            gpg --batch --import
+          fingerprints="$(
+            gpg --batch --with-colons --fingerprint |
+              awk -F: '/^fpr:/ { print $10 }'
+          )"
+          test "$fingerprints" = "F909806D13D9CD4CF403FA3C8C61E177EB6329E7"
+          git -C .publication-authorization fetch --force origin \
+            "refs/tags/$authorization_tag:refs/tags/$authorization_tag"
+          test "$(git -C .publication-authorization cat-file -t "refs/tags/$authorization_tag")" = "tag"
+          verify_output="$(
+            git -C .publication-authorization verify-tag --raw "$authorization_tag" 2>&1
+          )"
+          printf '%s\n' "$verify_output"
+          tag_signer="$(
+            printf '%s\n' "$verify_output" |
+              awk '/\[GNUPG:\] VALIDSIG / { print $3; exit }'
+          )"
+          test "$tag_signer" = "F909806D13D9CD4CF403FA3C8C61E177EB6329E7"
+          tag_commit="$(
+            git -C .publication-authorization rev-parse "$authorization_tag^{}"
+          )"
+          test "$(git -C .publication-authorization rev-parse HEAD)" = "$tag_commit"
+          node .publication-authorization/scripts/verify-publication-authorization.mjs \
+            --authorization .publication-authorization/release/publication-authorization.json \
+            --repository auraoneai-github-app \
+            --source-commit "${{ needs.build.outputs.source_commit }}" \
+            --package @auraone/github-app \
+            --version "${{ needs.build.outputs.version }}" \
+            --channel npm
+      - name: Attest the exact downloaded npm tarball
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: release/${{ needs.build.outputs.tarball }}
+      - name: Check for an exact prior publication
+        id: registry
+        env:
+          PACKAGE_NAME: "@auraone/github-app"
+          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
+          TARBALL_DIR: release
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from "node:crypto";
+          import { appendFileSync, readFileSync, readdirSync } from "node:fs";
+          import { spawnSync } from "node:child_process";
+          const spec = `${process.env.PACKAGE_NAME}@${process.env.PACKAGE_VERSION}`;
+          const result = spawnSync("npm", ["view", spec, "dist.integrity", "--json"], {
+            encoding: "utf8",
+          });
+          if (result.status !== 0) {
+            if (!/E404|not found/i.test(`${result.stdout}\n${result.stderr}`)) {
+              throw new Error(result.stderr || `npm view failed for ${spec}`);
+            }
+            appendFileSync(process.env.GITHUB_OUTPUT, "exists=false\n");
+            process.exit(0);
+          }
+          const [tarball] = readdirSync(process.env.TARBALL_DIR)
+            .filter((name) => name.endsWith(".tgz"));
+          if (!tarball) throw new Error("downloaded npm tarball is missing");
+          const localIntegrity = `sha512-${createHash("sha512")
+            .update(readFileSync(`${process.env.TARBALL_DIR}/${tarball}`))
+            .digest("base64")}`;
+          if (JSON.parse(result.stdout) !== localIntegrity) {
+            throw new Error(`${spec} exists with different tarball bytes`);
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, "exists=true\n");
+          NODE
+      - name: Publish the exact verified tarball with provenance
+        if: steps.registry.outputs.exists != 'true'
+        run: npm publish "release/${{ needs.build.outputs.tarball }}" --access public --provenance --tag "${{ needs.build.outputs.npm_tag }}"
+
+  verify:
+    name: verify npm registry and clean consumption
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14.0"
+          registry-url: "https://registry.npmjs.org"
+      - name: Verify exact npm version and signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.build.outputs.version }}"
+          for attempt in $(seq 1 12); do
+            actual="$(npm view "@auraone/github-app@$version" version 2>/dev/null || true)"
+            if [[ "$actual" == "$version" ]]; then
+              break
+            fi
+            if [[ "$attempt" == "12" ]]; then
+              echo "npm did not return @auraone/github-app@$version" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          temp_project="$(mktemp -d)"
+          npm --prefix "$temp_project" init --yes
+          npm install \
+            --prefix "$temp_project" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "@auraone/github-app@$version"
+          (
+            cd "$temp_project"
+            npm audit signatures
+          )
+          node -e "const GitHubApp = require('$temp_project/node_modules/@auraone/github-app'); if (typeof GitHubApp !== 'function') process.exit(1)"
+
+  github-release:
+    name: attest and attach matching GitHub Release assets
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: release
+      - name: Attest npm tarball
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: release/${{ needs.build.outputs.tarball }}
+      - name: Create or update the matching GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "@auraone/github-app ${{ needs.build.outputs.version }}"
+          fi
+          gh release upload "$RELEASE_TAG" \
+            release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
