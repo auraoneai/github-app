@@ -1,0 +1,18 @@
+# AuraOne GitHub App manifest (probot app.yml format)
+# https://probot.io/docs/development/#configuring-a-github-app
+name: aura-one-evaluation
+description: Runs AuraOne evaluation templates on pull requests and main pushes.
+url: https://auraone.ai/open/github-app
+public: false
+
+default_permissions:
+  checks: write
+  pull_requests: write
+  contents: read
+  issues: write
+  statuses: write
+
+default_events:
+  - pull_request
+  - check_run
+  - push

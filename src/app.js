@@ -7,8 +7,23 @@ const { App } = require("@octokit/app");
 const { AuraOneClient } = require("@auraone/sdk");
 const yaml = require("js-yaml");
 
-const CHECK_NAME = "AuraOne evaluation";
-const COMMENT_MARKER = "<!-- auraone-evaluation-summary -->";
+const {
+  CHECK_NAME,
+  repositoryCoordinates,
+  buildCheckRunExternalId,
+  matchesCheckRunExternalId,
+  startCheckRun: startCheckRunLifecycle,
+  markCheckRunInProgress: markCheckRunInProgressLifecycle,
+  completeCheckRun: completeCheckRunLifecycle,
+} = require("./check-runs");
+const {
+  COMMENT_MARKER,
+  LEGACY_COMMENT_MARKER,
+  isAppOwnedEvaluationComment,
+  findExistingEvaluationComment,
+  upsertMarkerComment,
+} = require("./marker-comment");
+
 const DEFAULT_PASS_THRESHOLD = 0.8;
 const CONFIG_PATHS = [".auraone.yml", ".auraone.yaml"];
 const GITHUB_MARKDOWN_LIMIT = 60000;
@@ -37,6 +52,14 @@ function normalizeThreshold(value) {
     throw new Error("`pass_threshold` must be a number from 0 to 1.");
   }
   return clamp(threshold, 0, 1);
+}
+
+function normalizeRegressionTolerance(value) {
+  const tolerance = Number(value ?? 0);
+  if (!Number.isFinite(tolerance)) {
+    throw new Error("`regression_tolerance` must be a number from 0 to 1.");
+  }
+  return clamp(tolerance, 0, 1);
 }
 
 function formatPercent(value) {
@@ -81,13 +104,6 @@ function safeErrorMessage(error) {
       ? error.message
       : "An unexpected error occurred.";
   return message.slice(0, 1000);
-}
-
-function repositoryCoordinates(repository) {
-  return {
-    owner: repository.owner.login,
-    repo: repository.name,
-  };
 }
 
 function configUrl(repository, sha, configPath) {
@@ -149,7 +165,66 @@ function renderResultTable(results, includeDetail = true) {
   return `${header}\n${body}`;
 }
 
-function evaluationDecision(results, score, threshold) {
+function compareResultsToBaseline(results, baselineResults, tolerance) {
+  const baselineByTemplate = new Map();
+  for (const entry of baselineResults || []) {
+    baselineByTemplate.set(entry.template, entry);
+  }
+
+  const rows = results.map(({ template, result }) => {
+    const baseline = baselineByTemplate.get(template);
+    const score = Number(result?.score);
+    const baselineScore = Number(baseline?.result?.score);
+    const hasScore = Number.isFinite(score);
+    const hasBaseline = Number.isFinite(baselineScore);
+    return {
+      template,
+      score: hasScore ? score : null,
+      baselineScore: hasBaseline ? baselineScore : null,
+      regressed:
+        hasScore && hasBaseline ? score < baselineScore - tolerance : null,
+    };
+  });
+
+  const comparable = rows.filter((row) => row.regressed !== null);
+  const regressedTemplates = rows
+    .filter((row) => row.regressed === true)
+    .map((row) => row.template);
+
+  return {
+    rows,
+    comparableCount: comparable.length,
+    regressed: regressedTemplates.length > 0,
+    regressedTemplates,
+  };
+}
+
+function renderBaselineTable(comparison) {
+  if (!comparison || !comparison.rows || comparison.rows.length === 0) {
+    return null;
+  }
+
+  const rows = comparison.rows
+    .map((row) => {
+      const base =
+        row.baselineScore === null ? "Not available" : formatPercent(row.baselineScore);
+      const head =
+        row.score === null ? "Not available" : formatPercent(row.score);
+      const delta =
+        row.score === null || row.baselineScore === null
+          ? "—"
+          : `${row.score - row.baselineScore >= 0 ? "+" : ""}${formatPercent(
+              row.score - row.baselineScore,
+            )}`;
+      const flag = row.regressed === true ? " ⚠" : "";
+      return `| ${escapeMarkdownCell(row.template)} | ${base} | ${head} | ${escapeMarkdownCell(delta)}${flag} |`;
+    })
+    .join("\n");
+
+  return `| Template | Base-branch score | PR score | Δ |\n| --- | ---: | ---: | ---: |\n${rows}`;
+}
+
+function evaluationDecision(results, score, threshold, baseline) {
   const hasErrors = results.some(({ error, result }) => {
     return Boolean(error) || !result || result.status !== "completed";
   });
@@ -160,6 +235,17 @@ function evaluationDecision(results, score, threshold) {
       conclusion: "action_required",
       remediation:
         "Verify the template identifiers, reward specifications, AuraOne credentials, and service availability. Then use **Run again** on this check.",
+    };
+  }
+
+  if (baseline && baseline.regressed) {
+    const regressedNames = baseline.regressedTemplates
+      .map((template) => `\`${template}\``)
+      .join(", ");
+    return {
+      label: "Regression detected",
+      conclusion: "failure",
+      remediation: `The pull request score dropped below the base-branch score for ${regressedNames}. Review the template evidence below, restore the regressed behavior, and push an updated commit or use **Run again** after the evidence changes.`,
     };
   }
 
@@ -181,27 +267,62 @@ function evaluationDecision(results, score, threshold) {
 
 class AuraGitHubApp {
   constructor(options = {}) {
+    const webhookSecret =
+      options.webhookSecret !== undefined
+        ? options.webhookSecret
+        : process.env.GITHUB_WEBHOOK_SECRET;
+    if (!webhookSecret || !String(webhookSecret).trim()) {
+      throw new Error(
+        "GITHUB_WEBHOOK_SECRET is required — without it webhook payloads " +
+          "cannot be signature-verified",
+      );
+    }
+
+    let apiKey =
+      options.auraApiKey !== undefined
+        ? options.auraApiKey
+        : process.env.AURAONE_API_KEY;
+    if (!apiKey && process.env.AURA_API_KEY) {
+      logger.warn("AURA_API_KEY is deprecated; set AURAONE_API_KEY instead");
+      apiKey = process.env.AURA_API_KEY;
+    }
+    if (
+      !apiKey ||
+      (options.auraApiKey !== undefined && !String(apiKey).startsWith("ak_")) ||
+      String(apiKey).startsWith("aura_live_") ||
+      String(apiKey).startsWith("aura_test_")
+    ) {
+      throw new Error(
+        "AURAONE_API_KEY must be a platform-issued ak_<8hex>_<64hex> key",
+      );
+    }
+
+    let orgId =
+      options.orgId || process.env.AURAONE_ORG_ID || process.env.AURA_ORG_ID;
+    if (!options.orgId && !process.env.AURAONE_ORG_ID && process.env.AURA_ORG_ID) {
+      logger.warn("AURA_ORG_ID is deprecated; set AURAONE_ORG_ID instead");
+    }
+    this.orgId = orgId || null;
+
     this.githubApp = new App({
       appId: options.appId || process.env.GITHUB_APP_ID,
       privateKey: options.privateKey || process.env.GITHUB_PRIVATE_KEY,
       webhooks: {
-        secret: options.webhookSecret || process.env.GITHUB_WEBHOOK_SECRET,
+        secret: webhookSecret,
       },
     });
 
+    const baseUrl =
+      options.auraBaseUrl ||
+      process.env.AURAONE_BASE_URL ||
+      process.env.AURA_BASE_URL ||
+      "https://api.auraone.ai";
+
     this.auraClient = new AuraOneClient({
-      apiKey:
-        options.auraApiKey ||
-        process.env.AURAONE_API_KEY ||
-        process.env.AURA_API_KEY,
-      baseUrl:
-        options.auraBaseUrl ||
-        process.env.AURAONE_BASE_URL ||
-        process.env.AURA_BASE_URL ||
-        "https://api.auraone.ai",
+      apiKey,
+      baseUrl,
+      ...(options.orgId ? { orgId: options.orgId } : {}),
     });
-    this.orgId =
-      options.orgId || process.env.AURAONE_ORG_ID || process.env.AURA_ORG_ID;
 
     this.setupWebhooks();
   }
@@ -234,12 +355,19 @@ class AuraGitHubApp {
 
   async handlePullRequest(context) {
     const { pull_request: pullRequest, repository } = context.payload;
+    const deliveryId = context.id || context.payload?.delivery_id;
 
     try {
       const octokit = await this.githubApp.getInstallationOctokit(
         context.payload.installation.id,
       );
-      await this.runPullRequestEvaluation(octokit, repository, pullRequest);
+      await this.runPullRequestEvaluation(
+        octokit,
+        repository,
+        pullRequest,
+        undefined,
+        deliveryId,
+      );
     } catch (error) {
       logger.error("Unable to initialize pull request evaluation", error);
     }
@@ -309,6 +437,7 @@ class AuraGitHubApp {
           repository,
           pullRequest.head.sha,
           pullRequest.id,
+          evaluationAttempt,
         ));
 
       if (existingCheckRunId) {
@@ -337,12 +466,18 @@ class AuraGitHubApp {
             "Add `.auraone.yml` or `.auraone.yaml` to the evaluated commit to enable AuraOne pull request checks.",
         };
 
-        await this.completeCheckRun(octokit, repository, checkRunId, {
-          conclusion: "neutral",
-          title: "AuraOne evaluation skipped",
-          summary: this.renderCheckSummary(skipped),
-          text: this.renderCheckText(skipped, repository),
-        });
+        await this.completeCheckRun(
+          octokit,
+          repository,
+          checkRunId,
+          {
+            conclusion: "neutral",
+            title: "AuraOne evaluation skipped",
+            summary: this.renderCheckSummary(skipped),
+            text: this.renderCheckText(skipped, repository),
+          },
+          pullRequest.head.sha,
+        );
         await this.publishEvaluationComment(
           octokit,
           repository,
@@ -369,12 +504,18 @@ class AuraGitHubApp {
             "Add at least one entry under `templates` in the AuraOne configuration, then use **Run again**.",
         };
 
-        await this.completeCheckRun(octokit, repository, checkRunId, {
-          conclusion: "action_required",
-          title: "AuraOne configuration needs a template",
-          summary: this.renderCheckSummary(emptyConfig),
-          text: this.renderCheckText(emptyConfig, repository),
-        });
+        await this.completeCheckRun(
+          octokit,
+          repository,
+          checkRunId,
+          {
+            conclusion: "action_required",
+            title: "AuraOne configuration needs a template",
+            summary: this.renderCheckSummary(emptyConfig),
+            text: this.renderCheckText(emptyConfig, repository),
+          },
+          pullRequest.head.sha,
+        );
         await this.publishEvaluationComment(
           octokit,
           repository,
@@ -406,7 +547,27 @@ class AuraGitHubApp {
               0,
             ) / scoredResults.length
           : 0;
-      const decision = evaluationDecision(results, overallScore, threshold);
+
+      const regressionTolerance = normalizeRegressionTolerance(
+        config.regression_tolerance,
+      );
+      const baselineComparison = await this.compareWithBaseBranch(
+        octokit,
+        repository,
+        pullRequest,
+        config,
+        templates,
+        results,
+        evaluationAttempt,
+        regressionTolerance,
+      );
+
+      const decision = evaluationDecision(
+        results,
+        overallScore,
+        threshold,
+        baselineComparison,
+      );
       const report = {
         decision: decision.label,
         score: overallScore,
@@ -414,19 +575,26 @@ class AuraGitHubApp {
         sha: pullRequest.head.sha,
         configPath,
         results,
+        baseline: baselineComparison,
         remediation: decision.remediation,
       };
       const detailsUrl = this.getDetailsUrl(
         results.find(({ result }) => result?.id)?.result.id,
       );
 
-      await this.completeCheckRun(octokit, repository, checkRunId, {
-        conclusion: decision.conclusion,
-        title: `AuraOne evaluation ${decision.label.toLowerCase()}`,
-        summary: this.renderCheckSummary(report),
-        text: this.renderCheckText(report, repository),
-        detailsUrl,
-      });
+      await this.completeCheckRun(
+        octokit,
+        repository,
+        checkRunId,
+        {
+          conclusion: decision.conclusion,
+          title: `AuraOne evaluation ${decision.label.toLowerCase()}`,
+          summary: this.renderCheckSummary(report),
+          text: this.renderCheckText(report, repository),
+          detailsUrl,
+        },
+        pullRequest.head.sha,
+      );
       await this.publishEvaluationComment(
         octokit,
         repository,
@@ -451,12 +619,18 @@ class AuraGitHubApp {
 
       if (checkRunId) {
         try {
-          await this.completeCheckRun(octokit, repository, checkRunId, {
-            conclusion: "failure",
-            title: "AuraOne evaluation error",
-            summary: this.renderCheckSummary(report),
-            text: this.renderCheckText(report, repository),
-          });
+          await this.completeCheckRun(
+            octokit,
+            repository,
+            checkRunId,
+            {
+              conclusion: "failure",
+              title: "AuraOne evaluation error",
+              summary: this.renderCheckSummary(report),
+              text: this.renderCheckText(report, repository),
+            },
+            pullRequest.head.sha,
+          );
         } catch (checkError) {
           logger.error("Unable to publish failed Check Run", checkError);
         }
@@ -481,6 +655,7 @@ class AuraGitHubApp {
     pullRequest,
     evaluationAttempt = pullRequest.head.sha,
   ) {
+    const attemptKey = evaluationAttempt || pullRequest.head.sha;
     const results = [];
 
     for (const template of templates) {
@@ -503,7 +678,7 @@ class AuraGitHubApp {
           config: template.config,
           wait: true,
           timeoutSeconds: 600,
-          idempotencyKey: `gh-${pullRequest.id}-${evaluationAttempt}-${template.id}`,
+          idempotencyKey: `gh-${pullRequest.id}-${attemptKey}-${template.id}`,
         });
 
         results.push({ template: templateName, result });
@@ -521,6 +696,82 @@ class AuraGitHubApp {
     }
 
     return results;
+  }
+
+  /**
+   * Regression detection (H7): re-runs the configured templates against the
+   * pull request's base-branch commit and compares per-template scores. A
+   * template regresses when its PR score drops more than `tolerance` below
+   * the base-branch score. Opt out with `compare_to_base: false`.
+   */
+  async compareWithBaseBranch(
+    octokit,
+    repository,
+    pullRequest,
+    config,
+    templates,
+    headResults,
+    evaluationAttempt,
+    tolerance,
+  ) {
+    const baseSha = pullRequest.base?.sha;
+
+    if (config.compare_to_base === false) {
+      return {
+        status: "disabled",
+        baseSha: baseSha || null,
+        rows: [],
+        regressed: false,
+        regressedTemplates: [],
+      };
+    }
+
+    if (!baseSha) {
+      return {
+        status: "skipped",
+        baseSha: null,
+        rows: [],
+        regressed: false,
+        regressedTemplates: [],
+      };
+    }
+
+    try {
+      const baseBundleUrl = await this.createAgentBundle(octokit, repository, {
+        head: { sha: baseSha },
+      });
+      const baselineResults = await this.runEvaluations(
+        templates,
+        baseBundleUrl,
+        { id: pullRequest.id, head: { sha: baseSha } },
+        `${evaluationAttempt || pullRequest.head.sha}-base`,
+      );
+      const comparison = compareResultsToBaseline(
+        headResults,
+        baselineResults,
+        tolerance,
+      );
+      return {
+        status:
+          comparison.comparableCount > 0 ? "completed" : "inconclusive",
+        baseSha,
+        ...comparison,
+      };
+    } catch (error) {
+      logger.error(
+        "Baseline evaluation failed; regression check inconclusive",
+        error,
+      );
+      return {
+        status: "unavailable",
+        baseSha,
+        error: safeErrorMessage(error),
+        rows: [],
+        comparableCount: 0,
+        regressed: false,
+        regressedTemplates: [],
+      };
+    }
   }
 
   async handleMainPush(context) {
@@ -574,7 +825,7 @@ class AuraGitHubApp {
           return { config: yaml.load(content) || {}, path };
         }
       } catch (error) {
-        if (error.status === 404) continue;
+        if (error.status === 404 || error.message === "404") continue;
         throw new Error(`Unable to read ${path}: ${safeErrorMessage(error)}`);
       }
     }
@@ -585,109 +836,132 @@ class AuraGitHubApp {
 
   async createAgentBundle(octokit, repository, pullRequest) {
     const { owner, repo } = repositoryCoordinates(repository);
-    return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(
-      repo,
-    )}/archive/${encodeURIComponent(pullRequest.head.sha)}.tar.gz`;
-  }
-
-  async startCheckRun(octokit, repository, sha, pullRequestId) {
-    const coordinates = repositoryCoordinates(repository);
-    const externalId = `auraone-pr-${pullRequestId}-${sha}`;
-    const { data: existing } = await octokit.rest.checks.listForRef({
-      ...coordinates,
-      ref: sha,
-      check_name: CHECK_NAME,
-      filter: "latest",
-      per_page: 100,
-    });
-    const existingCheck = existing.check_runs.find(
-      (check) => check.external_id === externalId,
-    );
-
-    let checkRunId;
-    if (existingCheck) {
-      checkRunId = existingCheck.id;
-      await octokit.rest.checks.update({
-        ...coordinates,
-        check_run_id: checkRunId,
-        status: "queued",
-        output: {
-          title: "AuraOne evaluation queued",
-          summary: "Waiting to start evaluation for this commit.",
-        },
-      });
-    } else {
-      const { data } = await octokit.rest.checks.create({
-        ...coordinates,
-        name: CHECK_NAME,
-        head_sha: sha,
-        status: "queued",
-        external_id: externalId,
-        output: {
-          title: "AuraOne evaluation queued",
-          summary: "Waiting to start evaluation for this commit.",
-        },
-      });
-      checkRunId = data.id;
+    const sha = pullRequest.head.sha;
+    const publicArchive = `https://github.com/${encodeURIComponent(
+      owner,
+    )}/${encodeURIComponent(repo)}/archive/${encodeURIComponent(sha)}.tar.gz`;
+    if (!repository.private || typeof octokit?.auth !== "function") {
+      return publicArchive;
     }
 
-    await this.markCheckRunInProgress(octokit, repository, checkRunId);
-    return checkRunId;
+    const tarballApi = `https://api.github.com/repos/${encodeURIComponent(
+      owner,
+    )}/${encodeURIComponent(repo)}/tarball/${encodeURIComponent(sha)}`;
+    const { token } = await octokit.auth({ type: "installation" });
+    const response = await fetch(tarballApi, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      redirect: "manual",
+    });
+    const signedUrl = response.headers.get("location");
+    if (response.status !== 302 || !signedUrl) {
+      throw new Error(
+        `Failed to resolve private tarball for ${repository.full_name || `${owner}/${repo}`}@${sha}: HTTP ${response.status}`,
+      );
+    }
+    return signedUrl;
+  }
+
+  async postStatus(octokit, repository, sha, status) {
+    if (typeof octokit?.rest?.repos?.createCommitStatus === "function") {
+      await octokit.rest.repos.createCommitStatus({
+        ...repositoryCoordinates(repository),
+        sha,
+        ...status,
+      });
+    }
+  }
+
+  async startCheckRun(octokit, repository, sha, pullRequestId, deliveryId) {
+    if (!octokit?.rest?.checks) {
+      await this.postStatus(octokit, repository, sha, {
+        state: "pending",
+        description: "AuraOne evaluation in progress...",
+        context: "auraone/evaluation",
+      });
+      return `status-${sha}`;
+    }
+    return startCheckRunLifecycle(
+      octokit,
+      repository,
+      sha,
+      pullRequestId,
+      deliveryId,
+    );
   }
 
   async markCheckRunInProgress(octokit, repository, checkRunId) {
-    await octokit.rest.checks.update({
-      ...repositoryCoordinates(repository),
-      check_run_id: checkRunId,
-      status: "in_progress",
-      started_at: new Date().toISOString(),
-      output: {
-        title: "AuraOne evaluation in progress",
-        summary:
-          "Running the configured AuraOne templates for this pull request commit.",
-      },
-    });
+    if (!octokit?.rest?.checks) return;
+    await markCheckRunInProgressLifecycle(octokit, repository, checkRunId);
   }
 
-  async completeCheckRun(octokit, repository, checkRunId, report) {
-    const parameters = {
-      ...repositoryCoordinates(repository),
-      check_run_id: checkRunId,
-      status: "completed",
-      conclusion: report.conclusion,
-      completed_at: new Date().toISOString(),
-      output: {
-        title: report.title,
-        summary: report.summary,
-        text: report.text,
-      },
-      actions: [
-        {
-          label: "Run again",
-          description: "Run the AuraOne evaluation again",
-          identifier: "rerun",
-        },
-      ],
-    };
-
-    if (report.detailsUrl) {
-      parameters.details_url = report.detailsUrl;
+  async completeCheckRun(octokit, repository, checkRunId, report, sha) {
+    if (!octokit?.rest?.checks) {
+      if (sha) {
+        const state =
+          report.conclusion === "success" || report.conclusion === "neutral"
+            ? "success"
+            : report.conclusion === "failure"
+              ? "failure"
+              : "error";
+        await this.postStatus(octokit, repository, sha, {
+          state,
+          description: report.title || "AuraOne evaluation completed",
+          context: "auraone/evaluation",
+          ...(report.detailsUrl ? { target_url: report.detailsUrl } : {}),
+        });
+      }
+      return;
     }
-
-    await octokit.rest.checks.update(parameters);
+    await completeCheckRunLifecycle(octokit, repository, checkRunId, report);
   }
 
   renderCheckSummary(report) {
     const score =
       report.score === null ? "Not available" : formatPercent(report.score);
 
-    return [
+    const lines = [
       `**Decision:** ${escapeMarkdownCell(report.decision)}`,
       `**Score:** ${escapeMarkdownCell(score)}`,
       `**Required threshold:** ${formatPercent(report.threshold)}`,
+    ];
+
+    if (report.baseline?.status === "completed") {
+      const baselineScores = report.baseline.rows
+        .map((row) => row.baselineScore)
+        .filter((value) => value !== null);
+      const baselineMean =
+        baselineScores.length > 0
+          ? baselineScores.reduce((sum, value) => sum + value, 0) /
+            baselineScores.length
+          : null;
+      lines.push(
+        `**Base-branch score:** ${
+          baselineMean === null ? "Not available" : formatPercent(baselineMean)
+        } (\`${escapeMarkdownCell(String(report.baseline.baseSha).slice(0, 12))}\`)`,
+      );
+    } else if (
+      report.baseline &&
+      report.baseline.status !== "disabled" &&
+      report.baseline.status !== "skipped"
+    ) {
+      lines.push(
+        `**Base-branch score:** ${escapeMarkdownCell(
+          `Inconclusive (${report.baseline.status})`,
+        )}`,
+      );
+    }
+
+    lines.push(
       `**Evaluated commit:** \`${escapeMarkdownCell(report.sha)}\``,
       `**Configuration:** \`${escapeMarkdownCell(report.configPath)}\``,
-    ].join("  \n");
+    );
+
+    return lines.join("  \n");
   }
 
   renderCheckText(report, repository) {
@@ -699,15 +973,21 @@ class AuraGitHubApp {
     );
 
     if (report.error) {
+      sections.push(`### Error\n\n${escapeMarkdownCell(report.error)}`);
+    }
+
+    sections.push(
+      `### Template evidence\n\n${renderResultTable(report.results)}`,
+    );
+
+    const baselineTable = renderBaselineTable(report.baseline);
+    if (baselineTable) {
       sections.push(
-        `### Error\n\n${escapeMarkdownCell(report.error)}`,
+        `### Base-branch regression check\n\n${baselineTable}`,
       );
     }
 
-    sections.push(`### Template evidence\n\n${renderResultTable(report.results)}`);
-    sections.push(
-      `### Next step\n\n${escapeMarkdownCell(report.remediation)}`,
-    );
+    sections.push(`### Next step\n\n${escapeMarkdownCell(report.remediation)}`);
 
     if (sourceUrl) {
       sections.push(
@@ -726,25 +1006,38 @@ class AuraGitHubApp {
   renderEvaluationComment(report) {
     const score =
       report.score === null ? "Not available" : formatPercent(report.score);
+    const baselineLine =
+      report.baseline?.status === "completed"
+        ? `**Base-branch score:** ${escapeMarkdownCell(
+            report.baseline.rows
+              .map((row) => row.baselineScore)
+              .filter((value) => value !== null)
+              .map((value) => formatPercent(value))
+              .join(" · ") || "Not available",
+          )}  `
+        : null;
 
-    return limitMarkdown([
-      COMMENT_MARKER,
-      "## AuraOne evaluation",
-      "",
-      `**Decision:** ${escapeMarkdownCell(report.decision)}  `,
-      `**Score:** ${escapeMarkdownCell(score)}  `,
-      `**Required threshold:** ${formatPercent(report.threshold)}  `,
-      `**Evaluated commit:** \`${escapeMarkdownCell(report.sha)}\`  `,
-      `**Configuration:** \`${escapeMarkdownCell(report.configPath)}\``,
-      "",
-      renderResultTable(report.results, false),
-      "",
-      "### Next step",
-      "",
-      escapeMarkdownCell(report.remediation),
-      "",
-      "_This comment is updated in place when AuraOne evaluates a newer commit._",
-    ].join("\n"));
+    return limitMarkdown(
+      [
+        COMMENT_MARKER,
+        "## AuraOne evaluation",
+        "",
+        `**Decision:** ${escapeMarkdownCell(report.decision)}  `,
+        `**Score:** ${escapeMarkdownCell(score)}  `,
+        `**Required threshold:** ${formatPercent(report.threshold)}  `,
+        ...(baselineLine ? [baselineLine] : []),
+        `**Evaluated commit:** \`${escapeMarkdownCell(report.sha)}\`  `,
+        `**Configuration:** \`${escapeMarkdownCell(report.configPath)}\``,
+        "",
+        renderResultTable(report.results, false),
+        "",
+        "### Next step",
+        "",
+        escapeMarkdownCell(report.remediation),
+        "",
+        "_This comment is updated in place when AuraOne evaluates a newer commit._",
+      ].join("\n"),
+    );
   }
 
   async publishEvaluationComment(
@@ -778,47 +1071,18 @@ class AuraGitHubApp {
     enabled = true,
   ) {
     if (!enabled) return;
-
-    const coordinates = repositoryCoordinates(repository);
-    const listParameters = {
-      ...coordinates,
-      issue_number: pullRequest.number,
-      per_page: 100,
-    };
-    const comments =
-      typeof octokit.paginate === "function"
-        ? await octokit.paginate(
-            octokit.rest.issues.listComments,
-            listParameters,
-          )
-        : (await octokit.rest.issues.listComments(listParameters)).data;
-    const existing = comments.find(
-      (comment) =>
-        comment.user?.type === "Bot" &&
-        typeof comment.body === "string" &&
-        comment.body.includes(COMMENT_MARKER),
-    );
     const body = this.renderEvaluationComment(report);
-
-    if (existing) {
-      await octokit.rest.issues.updateComment({
-        ...coordinates,
-        comment_id: existing.id,
-        body,
-      });
-      return;
-    }
-
-    await octokit.rest.issues.createComment({
-      ...coordinates,
-      issue_number: pullRequest.number,
-      body,
-    });
+    await upsertMarkerComment(octokit, repository, pullRequest, body, enabled);
   }
 
   getDetailsUrl(evaluationId) {
     if (!evaluationId) return null;
-    const baseUrl = this.auraClient.baseUrl || "https://api.auraone.ai";
+    const baseUrl =
+      this.auraClient.baseUrl ||
+      (typeof this.auraClient.getBaseUrl === "function"
+        ? this.auraClient.getBaseUrl()
+        : null) ||
+      "https://api.auraone.ai";
     return `${baseUrl.replace(/\/api\/?$/, "")}/evaluations/${encodeURIComponent(
       evaluationId,
     )}`;
@@ -857,7 +1121,17 @@ class AuraGitHubApp {
 
 module.exports = AuraGitHubApp;
 module.exports.escapeMarkdownCell = escapeMarkdownCell;
+module.exports.compareResultsToBaseline = compareResultsToBaseline;
+module.exports.evaluationDecision = evaluationDecision;
+module.exports.renderBaselineTable = renderBaselineTable;
+module.exports.normalizeRegressionTolerance = normalizeRegressionTolerance;
 module.exports.COMMENT_MARKER = COMMENT_MARKER;
+module.exports.LEGACY_COMMENT_MARKER = LEGACY_COMMENT_MARKER;
+module.exports.CHECK_NAME = CHECK_NAME;
+module.exports.buildCheckRunExternalId = buildCheckRunExternalId;
+module.exports.matchesCheckRunExternalId = matchesCheckRunExternalId;
+module.exports.isAppOwnedEvaluationComment = isAppOwnedEvaluationComment;
+module.exports.findExistingEvaluationComment = findExistingEvaluationComment;
 
 if (require.main === module) {
   const app = new AuraGitHubApp();
