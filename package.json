@@ -1,7 +1,7 @@
 {
   "name": "@auraone/github-app",
   "version": "1.0.0",
-  "description": "GitHub App for automated AuraOne evaluations on pull requests",
+  "description": "Self-hosted GitHub App for AI evaluation Check Runs: runs AuraOne evaluation templates on pull requests.",
   "main": "src/app.js",
   "scripts": {
     "start": "node src/app.js",
@@ -11,14 +11,13 @@
     "lint:fix": "eslint src --ext .js --fix"
   },
   "keywords": [
-    "github",
-    "app",
-    "ci-cd",
-    "aura-one",
-    "ai",
-    "agents",
-    "evaluation",
-    "automation"
+    "github-app",
+    "github-checks",
+    "ai-evaluation",
+    "llm-evaluation",
+    "pull-request",
+    "self-hosted",
+    "auraone"
   ],
   "author": "AuraOne Team",
   "license": "MIT",
@@ -37,8 +36,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/auraoneai/AuraOne.git",
-    "directory": "sdks/github-app"
+    "url": "https://github.com/auraoneai/github-app.git"
+  },
+  "homepage": "https://auraone.ai/open/github-app",
+  "bugs": {
+    "url": "https://github.com/auraoneai/github-app/issues"
   },
   "files": [
     "src",
